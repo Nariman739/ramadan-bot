@@ -475,7 +475,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ─────────────────────────────────────────────────────────────
 async def post_init(app: Application):
-    """Start the OAuth callback web server."""
+    """Start the OAuth callback web server and register bot commands."""
+    # Register commands in Telegram menu
+    from telegram import BotCommand
+    await app.bot.set_my_commands([
+        BotCommand("start", "Запуск и подписка на уведомления"),
+        BotCommand("today", "Время намаза на сегодня"),
+        BotCommand("schedule", "Расписание всего Рамадана"),
+        BotCommand("connect", "Подключить Google Calendar"),
+        BotCommand("stop", "Отключить уведомления"),
+        BotCommand("help", "Список команд"),
+    ])
+    logger.info("Bot commands registered")
+
+    # Start OAuth callback web server
     web_app = web.Application()
     web_app.router.add_get("/callback", oauth_callback)
 
