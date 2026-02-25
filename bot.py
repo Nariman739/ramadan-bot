@@ -31,7 +31,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ── Config ───────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
-    logger.error("BOT_TOKEN not set! Check Railway environment variables.")
+    print("ERROR: BOT_TOKEN not set! Check Railway environment variables.")
     raise SystemExit("BOT_TOKEN is required")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
