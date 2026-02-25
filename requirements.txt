@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==21.10
+aiohttp==3.11.12
+google-auth-oauthlib==1.2.4
+google-api-python-client==2.190.0
