@@ -641,9 +641,40 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── Webhook Handler ──────────────────────────────────────────────────
+async def webhook_handler(request):
+    """Handle Telegram webhook updates via aiohttp."""
+    app = request.app["telegram_app"]
+    data = await request.json()
+    update = Update.de_json(data, app.bot)
+    await app.process_update(update)
+    return web.Response(status=200)
+
+
+async def health_check(request):
+    return web.Response(text="OK")
+
+
 # ── Main ─────────────────────────────────────────────────────────────
-async def post_init(app: Application):
-    """Start the OAuth callback web server and register bot commands."""
+async def main_async():
+    """Run bot with webhook (no polling = no Conflict errors)."""
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Add handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("connect", cmd_connect))
+    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("city", cmd_city))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(city_callback, pattern=r"^city:"))
+
+    # Initialize and start the application
+    await app.initialize()
+    await app.start()
+
+    # Register bot commands
     from telegram import BotCommand
     await app.bot.set_my_commands([
         BotCommand("start", "Запуск и подписка"),
@@ -656,43 +687,17 @@ async def post_init(app: Application):
     ])
     logger.info("Bot commands registered")
 
-    web_app = web.Application()
-    web_app.router.add_get("/callback", oauth_callback)
-
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-    app.bot_data["web_runner"] = runner
-    logger.info(f"OAuth web server started on port {PORT}")
-
-
-async def post_shutdown(app: Application):
-    runner = app.bot_data.get("web_runner")
-    if runner:
-        await runner.cleanup()
-
-
-def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
+    # Set webhook (this kills any polling connections!)
+    base_url = CALLBACK_URL.rsplit("/callback", 1)[0]
+    webhook_url = f"{base_url}/webhook"
+    await app.bot.set_webhook(
+        url=webhook_url,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
     )
+    logger.info(f"Webhook set to {webhook_url}")
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("connect", cmd_connect))
-    app.add_handler(CommandHandler("today", cmd_today))
-    app.add_handler(CommandHandler("schedule", cmd_schedule))
-    app.add_handler(CommandHandler("city", cmd_city))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CallbackQueryHandler(city_callback, pattern=r"^city:"))
-
-    # Daily notifications (Astana time)
+    # Daily notifications
     app.job_queue.run_daily(
         send_morning,
         time=dt_time(hour=4, minute=0, tzinfo=TZ),
@@ -704,11 +709,31 @@ def main():
         name="evening",
     )
 
-    logger.info(f"Bot started! Users: {len(users)}")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    # Start aiohttp web server (handles both webhook and OAuth callback)
+    web_app = web.Application()
+    web_app["telegram_app"] = app
+    web_app.router.add_post("/webhook", webhook_handler)
+    web_app.router.add_get("/callback", oauth_callback)
+    web_app.router.add_get("/", health_check)
+
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+    logger.info(f"Bot started with webhook! Users: {len(users)}, Port: {PORT}")
+
+    # Keep running forever
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
+
+
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
