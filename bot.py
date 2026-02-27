@@ -21,6 +21,8 @@ from collections import defaultdict
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import time
+
 import aiohttp
 from aiohttp import web
 from google.oauth2.credentials import Credentials
@@ -236,48 +238,62 @@ def make_oauth_flow() -> Flow:
     return flow
 
 
-def add_events_to_calendar(creds: Credentials, days: list[dict], city_name: str) -> int:
-    """Add Ramadan events to Google Calendar. Returns count of events added."""
+def add_events_to_calendar(creds: Credentials, days: list[dict], city_name: str) -> tuple[int, int]:
+    """Add Ramadan events to Google Calendar. Returns (success_count, error_count)."""
     service = build("calendar", "v3", credentials=creds)
-    count = 0
+    success = 0
+    errors = 0
 
     for day in days:
         d = day["date"]
         hd = day["hijri_day"]
 
         # Suhoor
-        ih, im = map(int, day["imsak"].split(":"))
-        suhoor_start = d.replace(hour=ih, minute=im, second=0, microsecond=0)
+        try:
+            ih, im = map(int, day["imsak"].split(":"))
+            suhoor_start = d.replace(hour=ih, minute=im, second=0, microsecond=0)
 
-        service.events().insert(calendarId="primary", body={
-            "summary": f"Сухур (саһарлық) — день {hd}",
-            "start": {"dateTime": suhoor_start.isoformat(), "timeZone": "Asia/Almaty"},
-            "end": {"dateTime": (suhoor_start + timedelta(minutes=5)).isoformat(), "timeZone": "Asia/Almaty"},
-            "description": f"г. {city_name}\nИмсак: {day['imsak']}\nФаджр: {day['fajr']}\nДень {hd} Рамадана",
-            "reminders": {
-                "useDefault": False,
-                "overrides": [{"method": "popup", "minutes": 30}],
-            },
-        }).execute()
-        count += 1
+            service.events().insert(calendarId="primary", body={
+                "summary": f"Сухур (саһарлық) — день {hd}",
+                "start": {"dateTime": suhoor_start.isoformat(), "timeZone": "Asia/Almaty"},
+                "end": {"dateTime": (suhoor_start + timedelta(minutes=5)).isoformat(), "timeZone": "Asia/Almaty"},
+                "description": f"г. {city_name}\nИмсак: {day['imsak']}\nФаджр: {day['fajr']}\nДень {hd} Рамадана",
+                "reminders": {
+                    "useDefault": False,
+                    "overrides": [{"method": "popup", "minutes": 30}],
+                },
+            }).execute()
+            success += 1
+        except Exception as e:
+            logger.error(f"Failed to create suhoor event day {hd}: {e}")
+            errors += 1
+
+        # Small delay to avoid Google API rate limits
+        time.sleep(0.3)
 
         # Iftar
-        mh, mm = map(int, day["maghrib"].split(":"))
-        iftar_start = d.replace(hour=mh, minute=mm, second=0, microsecond=0)
+        try:
+            mh, mm = map(int, day["maghrib"].split(":"))
+            iftar_start = d.replace(hour=mh, minute=mm, second=0, microsecond=0)
 
-        service.events().insert(calendarId="primary", body={
-            "summary": f"Ифтар (ауызашар) — день {hd}",
-            "start": {"dateTime": iftar_start.isoformat(), "timeZone": "Asia/Almaty"},
-            "end": {"dateTime": (iftar_start + timedelta(minutes=30)).isoformat(), "timeZone": "Asia/Almaty"},
-            "description": f"г. {city_name}\nМагриб: {day['maghrib']}\nИша: {day['isha']}\nДень {hd} Рамадана",
-            "reminders": {
-                "useDefault": False,
-                "overrides": [{"method": "popup", "minutes": 15}],
-            },
-        }).execute()
-        count += 1
+            service.events().insert(calendarId="primary", body={
+                "summary": f"Ифтар (ауызашар) — день {hd}",
+                "start": {"dateTime": iftar_start.isoformat(), "timeZone": "Asia/Almaty"},
+                "end": {"dateTime": (iftar_start + timedelta(minutes=30)).isoformat(), "timeZone": "Asia/Almaty"},
+                "description": f"г. {city_name}\nМагриб: {day['maghrib']}\nИша: {day['isha']}\nДень {hd} Рамадана",
+                "reminders": {
+                    "useDefault": False,
+                    "overrides": [{"method": "popup", "minutes": 15}],
+                },
+            }).execute()
+            success += 1
+        except Exception as e:
+            logger.error(f"Failed to create iftar event day {hd}: {e}")
+            errors += 1
 
-    return count
+        time.sleep(0.3)
+
+    return success, errors
 
 
 # ── OAuth Callback (Web Server) ─────────────────────────────────────
@@ -322,26 +338,30 @@ async def oauth_callback(request):
         city_name = get_city_name(city_key)
 
         # Add events (sync call in thread)
-        count = await asyncio.to_thread(add_events_to_calendar, creds, target, city_name)
+        success, errors = await asyncio.to_thread(add_events_to_calendar, creds, target, city_name)
 
         # Notify via Telegram
         bot = Bot(BOT_TOKEN)
+        error_note = f"\n⚠️ Не удалось создать {errors} событий." if errors else ""
         async with bot:
             await bot.send_message(
                 int(chat_id_str),
                 f"Google Calendar подключен!\n\n"
                 f"Город: {city_name}\n"
-                f"Добавлено {count} событий в ваш календарь:\n"
+                f"Добавлено {success} событий в ваш календарь:\n"
                 f"- Сухур с напоминанием за 30 мин\n"
-                f"- Ифтар с напоминанием за 15 мин\n\n"
-                f"Откройте Google Calendar — всё уже там!"
+                f"- Ифтар с напоминанием за 15 мин"
+                f"{error_note}\n\n"
+                f"Откройте Google Calendar — всё уже там!\n"
+                f"Если чего-то не хватает — /sync для повторной синхронизации."
             )
 
+        status = "Готово!" if not errors else f"Готово (с {errors} ошибками)"
         return web.Response(
             text=(
                 "<html><body style='font-family:sans-serif;text-align:center;padding:50px'>"
-                "<h2>Готово!</h2>"
-                f"<p>Все события Рамадана ({city_name}) добавлены в ваш Google Calendar.</p>"
+                f"<h2>{status}</h2>"
+                f"<p>Добавлено {success} событий Рамадана ({city_name}) в Google Calendar.</p>"
                 "<p>Можете закрыть эту страницу и вернуться в Telegram.</p>"
                 "</body></html>"
             ),
@@ -485,6 +505,7 @@ async def city_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/today — время на сегодня\n"
         f"/schedule — расписание всего Рамадана\n"
         f"/connect — подключить Google Calendar\n"
+        f"/sync — повторная синхронизация календаря\n"
         f"/city — сменить город\n"
         f"/stop — отключить уведомления\n\n"
         f"Рамадан мубарак!"
@@ -625,6 +646,60 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Re-sync Ramadan events to Google Calendar using saved token."""
+    chat_id = update.effective_chat.id
+    chat_id_str = str(chat_id)
+
+    tokens = load_tokens()
+    if chat_id_str not in tokens:
+        await update.message.reply_text(
+            "Google Calendar не подключен.\n"
+            "Используйте /connect для подключения."
+        )
+        return
+
+    city_key = get_user_city(chat_id)
+    city_name = get_city_name(city_key)
+
+    msg = await update.message.reply_text(
+        f"Синхронизирую события для {city_name}...\n"
+        "Это займёт ~30 секунд."
+    )
+
+    try:
+        token_data = tokens[chat_id_str]
+        creds = Credentials(
+            token=token_data["token"],
+            refresh_token=token_data.get("refresh_token"),
+            token_uri=token_data["token_uri"],
+            client_id=token_data["client_id"],
+            client_secret=token_data["client_secret"],
+        )
+
+        days = await fetch_ramadan(city_key)
+        today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        remaining = [d for d in days if d["date"] >= today]
+        target = remaining if remaining else days
+
+        success, errors = await asyncio.to_thread(add_events_to_calendar, creds, target, city_name)
+
+        error_note = f"\n⚠️ Не удалось создать {errors} событий." if errors else ""
+        await msg.edit_text(
+            f"Синхронизация завершена!\n\n"
+            f"Город: {city_name}\n"
+            f"Добавлено {success} событий.{error_note}\n\n"
+            f"Откройте Google Calendar — всё обновлено!"
+        )
+
+    except Exception as e:
+        logger.error(f"Sync error for {chat_id}: {e}")
+        await msg.edit_text(
+            "Ошибка синхронизации. Токен мог истечь.\n"
+            "Попробуйте /connect для повторного подключения."
+        )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     city_name = get_city_name(get_user_city(chat_id))
@@ -635,6 +710,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/today — время на сегодня\n"
         f"/schedule — расписание всего Рамадана\n"
         f"/connect — подключить Google Calendar\n"
+        f"/sync — повторная синхронизация календаря\n"
         f"/city — сменить город\n"
         f"/stop — отключить уведомления\n\n"
         f"Рамадан мубарак!"
@@ -667,6 +743,7 @@ async def main_async():
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
     app.add_handler(CommandHandler("city", cmd_city))
+    app.add_handler(CommandHandler("sync", cmd_sync))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(city_callback, pattern=r"^city:"))
 
@@ -681,6 +758,7 @@ async def main_async():
         BotCommand("today", "Время намаза на сегодня"),
         BotCommand("schedule", "Расписание всего Рамадана"),
         BotCommand("connect", "Подключить Google Calendar"),
+        BotCommand("sync", "Повторная синхронизация календаря"),
         BotCommand("city", "Сменить город"),
         BotCommand("stop", "Отключить уведомления"),
         BotCommand("help", "Список команд"),
